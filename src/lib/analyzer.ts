@@ -1,4 +1,4 @@
-import { fetchData, StockData } from './data-fetcher';
+import { fetchData, FetchDataResult, FetchDataError, StockData } from './data-fetcher';
 import { claudeAnalyze } from './ai-client';
 import { parseReport, ParsedReport } from './report-parser';
 import { saveReport } from './storage';
@@ -29,8 +29,6 @@ export async function analyzeStock(
   market: 'A' | 'HK' | 'US',
   onProgress?: ProgressCallback
 ): Promise<AnalysisResult> {
-  const startedAt = Date.now();
-
   // Step 0.0: API 优先取数（SKILL Step 0.0）
   const engines = describeEngines(market);
   onProgress?.('step', {
@@ -49,21 +47,42 @@ export async function analyzeStock(
   onProgress?.('fetching_data', { symbol, market });
 
   let rawData: StockData;
+  let fetchResult: FetchDataResult;
   try {
-    rawData = await fetchData(symbol, market);
+    fetchResult = await fetchData(symbol, market, {
+      onRetry: ({ attempt, delayMs, reason }) => {
+        // 把重试进度通过 step upsert 推给前端时间线
+        onProgress?.('step', {
+          key: 'fetch',
+          title: 'Step 0.0 · API 优先取数',
+          status: 'running',
+          detail: `第 ${attempt}/3 次尝试（${(delayMs / 1000).toFixed(0)}s 后重试）— ${reason || '上次失败'}`,
+        });
+      },
+    });
+    rawData = fetchResult.data;
   } catch (err) {
+    const fe = err as FetchDataError;
+    const reasonZh =
+      fe.code === 'TIMEOUT' ? '数据源持续超时（已自动重试 2 次）' :
+      fe.code === 'PARSE_ERROR' ? 'Python 脚本返回了无法解析的内容' :
+      fe.code === 'EXIT_NONZERO' ? `Python 脚本异常退出（exit ${fe.exitCode}）` :
+      (err as Error).message;
     onProgress?.('step', {
       key: 'fetch',
       title: 'Step 0.0 · API 优先取数',
       status: 'error',
-      detail: `数据采集失败：${(err as Error).message}`,
+      detail: `数据采集失败：${reasonZh}`,
+      meta: { error_code: fe.code, error_detail: fe.message, stderr_preview: fe.stderr?.slice(0, 500) },
     });
-    onProgress?.('data_error', { error: (err as Error).message });
-    throw err;
+    onProgress?.('data_error', { error: reasonZh });
+    throw new Error(reasonZh);
   }
 
   // 总结取数结果中的关键字段，让用户看到 AI 真正拿到了什么
-  const enginesUsed = ((rawData.raw?.meta as Record<string, unknown> | undefined)?.engines_used as string[] | undefined) ?? [];
+  const enginesUsed = fetchResult.enginesUsed.length
+    ? fetchResult.enginesUsed
+    : ((rawData.raw?.meta as Record<string, unknown> | undefined)?.engines_used as string[] | undefined) ?? [];
   const fetchedFields = [
     rawData.price !== null && `现价 ${rawData.price}`,
     rawData.marketCap !== null && `市值 ${(rawData.marketCap / 1e8).toFixed(1)} 亿`,
@@ -73,24 +92,36 @@ export async function analyzeStock(
     rawData.grossMargin !== null && `毛利率 ${rawData.grossMargin.toFixed(2)}%`,
     rawData.dividendYield !== null && `股息率 ${rawData.dividendYield.toFixed(2)}%`,
   ].filter(Boolean) as string[];
-  const missingFields = [
-    rawData.price === null && '现价',
-    rawData.pe === null && 'PE',
-    rawData.roe === null && 'ROE',
-  ].filter(Boolean) as string[];
+  // 完整的缺失字段列表（传给 AI 让它在报告里标注不确定性）
+  const missingFields = Object.entries({
+    price: rawData.price,
+    marketCap: rawData.marketCap,
+    pe: rawData.pe,
+    pb: rawData.pb,
+    roe: rawData.roe,
+    grossMargin: rawData.grossMargin,
+    dividendYield: rawData.dividendYield,
+    revenue: rawData.revenue,
+    netIncome: rawData.netIncome,
+    eps: rawData.eps,
+  }).filter(([, v]) => v === null).map(([k]) => k);
 
   onProgress?.('step', {
     key: 'fetch',
     title: 'Step 0.0 · API 优先取数',
     status: 'done',
-    detail: `已拿到 ${rawData.name}（${rawData.symbol}）的结构化数据${enginesUsed.length ? `，引擎：${enginesUsed.join(' + ')}` : ''}`,
+    detail: fetchResult.partial
+      ? `⚠️ 部分数据：${enginesUsed.join(' + ') || '降级引擎'} 兜底成功（${fetchResult.enginesFailed.length} 个引擎失败，缺失 ${missingFields.length} 个字段）`
+      : `已拿到 ${rawData.name}（${rawData.symbol}）的结构化数据${enginesUsed.length ? `，引擎：${enginesUsed.join(' + ')}` : ''}`,
     meta: {
       name: rawData.name,
       symbol: rawData.symbol,
       engines_used: enginesUsed,
+      engine_errors: fetchResult.enginesFailed,
+      partial: fetchResult.partial,
       key_fields: fetchedFields,
       missing_fields: missingFields,
-      elapsed_ms: Date.now() - startedAt,
+      elapsed_ms: fetchResult.elapsedMs,
     },
   });
   onProgress?.('data_fetched', rawData);
@@ -119,7 +150,7 @@ export async function analyzeStock(
   });
   onProgress?.('analyzing', { status: 'starting' });
 
-  const stream = await claudeAnalyze(symbol, market, rawData);
+  const stream = await claudeAnalyze(symbol, market, rawData as unknown as Record<string, unknown>, missingFields);
   let fullMarkdown = '';
 
   for await (const chunk of stream) {
