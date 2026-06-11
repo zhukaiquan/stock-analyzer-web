@@ -120,7 +120,10 @@ function extractDimensionScores(text: string, jsonData?: Record<string, unknown>
   const extractWithPatterns = (patterns: RegExp[], fallbackKeys: string[]): number => {
     for (const p of patterns) {
       const m = text.match(p);
-      if (m) return parseFloat(m[1]);
+      if (m) {
+        const num = parseFloat(m[1]);
+        if (!isNaN(num)) return num;
+      }
     }
     return readJsonScore(...fallbackKeys);
   };

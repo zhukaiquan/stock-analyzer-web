@@ -82,7 +82,7 @@ export default function AnalysisProgress({
             <span className="text-gray-500">{getStepText()}</span>
             <span className="font-medium">{Math.round(progress)}%</span>
           </div>
-          <Progress value={progress} className="h-2" />
+          <Progress value={progress} max={100} className="h-2" />
         </div>
 
         {error && (

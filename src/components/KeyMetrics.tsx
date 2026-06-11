@@ -25,6 +25,7 @@ interface MetricItem {
   icon: React.ReactNode;
   benchmark?: { good: number; bad: number };
   format?: 'number' | 'percent' | 'billion' | 'multiple';
+  lowerIsBetter?: boolean; // true for PE/PB (lower = better), false/default for ROE/grossMargin (higher = better)
 }
 
 export default function KeyMetrics({ metrics }: KeyMetricsProps) {
@@ -43,10 +44,17 @@ export default function KeyMetrics({ metrics }: KeyMetricsProps) {
     }
   };
 
-  const getMetricStatus = (value: number | null, benchmark?: { good: number; bad: number }) => {
+  const getMetricStatus = (value: number | null, benchmark?: { good: number; bad: number }, lowerIsBetter?: boolean) => {
     if (!benchmark || value === null) return null;
-    if (value >= benchmark.good) return { label: '优秀', color: 'bg-green-100 text-green-700', icon: <TrendingUp className="h-3 w-3" /> };
-    if (value <= benchmark.bad) return { label: '注意', color: 'bg-red-100 text-red-700', icon: <TrendingDown className="h-3 w-3" /> };
+    if (lowerIsBetter) {
+      // Lower values are better (PE, PB)
+      if (value <= benchmark.good) return { label: '优秀', color: 'bg-green-100 text-green-700', icon: <TrendingUp className="h-3 w-3" /> };
+      if (value >= benchmark.bad) return { label: '注意', color: 'bg-red-100 text-red-700', icon: <TrendingDown className="h-3 w-3" /> };
+    } else {
+      // Higher values are better (ROE, grossMargin, etc.)
+      if (value >= benchmark.good) return { label: '优秀', color: 'bg-green-100 text-green-700', icon: <TrendingUp className="h-3 w-3" /> };
+      if (value <= benchmark.bad) return { label: '注意', color: 'bg-red-100 text-red-700', icon: <TrendingDown className="h-3 w-3" /> };
+    }
     return { label: '一般', color: 'bg-yellow-100 text-yellow-700', icon: null };
   };
 
@@ -58,7 +66,8 @@ export default function KeyMetrics({ metrics }: KeyMetricsProps) {
       unit: '',
       icon: <BarChart3 className="h-5 w-5 text-blue-500" />,
       format: 'multiple',
-      benchmark: { good: 0, bad: 30 } // PE lower is generally better, but 0 means N/A
+      benchmark: { good: 15, bad: 30 },
+      lowerIsBetter: true
     },
     {
       label: '市净率 (PB)',
@@ -67,7 +76,8 @@ export default function KeyMetrics({ metrics }: KeyMetricsProps) {
       unit: '',
       icon: <BarChart3 className="h-5 w-5 text-purple-500" />,
       format: 'multiple',
-      benchmark: { good: 0, bad: 5 }
+      benchmark: { good: 1.5, bad: 5 },
+      lowerIsBetter: true
     },
     {
       label: '净资产收益率 (ROE)',
@@ -130,7 +140,7 @@ export default function KeyMetrics({ metrics }: KeyMetricsProps) {
       <CardContent>
         <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
           {metricsList.map((item) => {
-            const status = getMetricStatus(item.value, item.benchmark);
+            const status = getMetricStatus(item.value, item.benchmark, item.lowerIsBetter);
             const isNA = item.value === null;
 
             return (
