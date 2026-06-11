@@ -36,7 +36,13 @@ export default function Home() {
   const fetchReports = async () => {
     try {
       const response = await fetch('/api/reports');
+      if (!response.ok) {
+        throw new Error('获取报告列表失败');
+      }
       const data = await response.json();
+      if (!Array.isArray(data)) {
+        throw new Error('返回数据格式错误');
+      }
       setRecentReports(data.slice(0, 6));
     } catch {
       console.error('Failed to fetch reports');
@@ -46,7 +52,7 @@ export default function Home() {
   };
 
   const handleStockSelect = (stock: Stock) => {
-    router.push(`/analyze?symbol=${stock.symbol}&market=${stock.market}`);
+    router.push(`/analyze?symbol=${stock.symbol}&market=${stock.market}&name=${encodeURIComponent(stock.name)}`);
   };
 
   const handleDeleteReport = async (id: string) => {

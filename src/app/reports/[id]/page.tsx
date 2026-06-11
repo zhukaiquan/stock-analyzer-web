@@ -59,11 +59,20 @@ export default function ReportDetailPage() {
   const [report, setReport] = useState<Report | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [expandedSections, setExpandedSections] = useState<Set<number>>(new Set([0, 1, 2]));
+  const [expandedSections, setExpandedSections] = useState<Set<number>>(new Set());
 
   useEffect(() => {
     fetchReport();
   }, [params.id]);
+
+  // 报告加载后根据实际显示的章节数量初始化展开状态
+  useEffect(() => {
+    if (report) {
+      const displaySections = getDisplaySections(report.parsed.sections);
+      // 默认展开前 3 个章节（不超过实际章节数）
+      setExpandedSections(new Set(displaySections.slice(0, 3).map((_, i) => i)));
+    }
+  }, [report]);
 
   const fetchReport = async () => {
     try {
@@ -91,9 +100,16 @@ export default function ReportDetailPage() {
   };
 
   const handleReanalyze = () => {
-    if (report) {
-      router.push(`/analyze?symbol=${report.symbol}&market=${report.market}`);
+    if (!report) return;
+    const ageDays = Math.floor(
+      (Date.now() - new Date(report.createdAt).getTime()) / 86400000
+    );
+    const ageLabel = ageDays < 1 ? '今天' : `${ageDays} 天前`;
+    if (!confirm(`这份报告生成于${ageLabel}，确定要重新分析并生成新报告吗？将消耗 DeepSeek token。`)) {
+      return;
     }
+    // force=1 跳过 7 天缓存，重新跑 DeepSeek
+    router.push(`/analyze?symbol=${report.symbol}&market=${report.market}&force=1`);
   };
 
   const handleExport = () => {

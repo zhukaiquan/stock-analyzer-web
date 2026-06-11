@@ -39,7 +39,13 @@ export default function ReportsPage() {
   const fetchReports = async () => {
     try {
       const response = await fetch('/api/reports');
+      if (!response.ok) {
+        throw new Error('获取报告列表失败');
+      }
       const data = await response.json();
+      if (!Array.isArray(data)) {
+        throw new Error('返回数据格式错误');
+      }
       setReports(data);
     } catch {
       console.error('Failed to fetch reports');
