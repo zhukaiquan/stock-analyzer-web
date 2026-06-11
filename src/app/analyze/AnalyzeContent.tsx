@@ -3,7 +3,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useSearchParams, useRouter } from 'next/navigation';
 import StockSearch from '@/components/StockSearch';
-import AnalysisProgress from '@/components/AnalysisProgress';
+import AnalysisTimeline, { TimelineStep } from '@/components/AnalysisTimeline';
 import ScoreDashboard from '@/components/ScoreDashboard';
 import DimensionBreakdown from '@/components/DimensionBreakdown';
 import KeyMetrics from '@/components/KeyMetrics';
@@ -49,6 +49,28 @@ interface AnalysisResult {
   };
 }
 
+interface StepEventPayload {
+  key: string;
+  title: string;
+  detail?: string;
+  status: 'pending' | 'running' | 'done' | 'error';
+  meta?: Record<string, unknown>;
+}
+
+/** 从流式 markdown 中提取已写过的标题（# / ## / ### 行） */
+function extractHeadings(markdown: string): string[] {
+  const headings: string[] = [];
+  const lines = markdown.split('\n');
+  for (const line of lines) {
+    const m = line.match(/^#{1,3}\s+(.+?)\s*$/);
+    if (m) {
+      const title = m[1].trim().replace(/[#*`]/g, '');
+      if (title.length >= 2) headings.push(title);
+    }
+  }
+  return headings;
+}
+
 export default function AnalyzeContent() {
   const searchParams = useSearchParams();
   const router = useRouter();
@@ -56,26 +78,80 @@ export default function AnalyzeContent() {
   const [selectedStock, setSelectedStock] = useState<Stock | null>(null);
   const [status, setStatus] = useState<'idle' | 'fetching' | 'analyzing' | 'complete' | 'error'>('idle');
   const [progress, setProgress] = useState(0);
-  const [currentStep, setCurrentStep] = useState('');
   const [partialMarkdown, setPartialMarkdown] = useState('');
   const [error, setError] = useState<string | undefined>();
   const [result, setResult] = useState<AnalysisResult | null>(null);
+  // 时间线步骤：按 SSE 'step' 事件 upsert
+  const [steps, setSteps] = useState<TimelineStep[]>([]);
 
   // Throttle refs
   const lastUpdateTime = useRef(0);
   const updateTimerRef = useRef<NodeJS.Timeout | null>(null);
   const pendingMarkdown = useRef('');
   const analysisStarted = useRef(false);
+  // force=1 → 跳过 7 天报告缓存，强制重新跑 DeepSeek
+  const forceRef = useRef(false);
+
+  /** Upsert：相同 key 覆盖（保留旧的 meta + writtenSections），不存在则追加 */
+  const upsertStep = useCallback((payload: StepEventPayload) => {
+    setSteps(prev => {
+      const idx = prev.findIndex(s => s.key === payload.key);
+      const next: TimelineStep = {
+        key: payload.key,
+        title: payload.title,
+        detail: payload.detail,
+        status: payload.status,
+        meta: payload.meta,
+      };
+      if (idx >= 0) {
+        // 合并 meta（done 时保留 running 阶段写入的 meta，覆盖式更新）
+        const merged: TimelineStep = {
+          ...prev[idx],
+          ...next,
+          meta: { ...(prev[idx].meta || {}), ...(payload.meta || {}) },
+        };
+        const copy = [...prev];
+        copy[idx] = merged;
+        return copy;
+      }
+      return [...prev, next];
+    });
+  }, []);
+
+  /** 更新 analyze 步骤的"正在写的章节"和"已完成章节" */
+  const updateAnalyzeHeadings = useCallback((markdown: string) => {
+    const headings = extractHeadings(markdown);
+    if (headings.length === 0) return;
+    // 最后一个标题视为"正在写"，前面的视为"已完成"
+    const current = headings[headings.length - 1];
+    const written = headings.slice(0, -1);
+    setSteps(prev => {
+      const idx = prev.findIndex(s => s.key === 'analyze');
+      if (idx < 0) return prev;
+      // 只有 running 时才更新「正在写」；done 之后保留全部章节
+      const isRunning = prev[idx].status === 'running';
+      const copy = [...prev];
+      copy[idx] = {
+        ...prev[idx],
+        currentSection: isRunning ? current : undefined,
+        writtenSections: isRunning ? written : headings,
+      };
+      return copy;
+    });
+  }, []);
 
   // Auto-start if symbol is in URL (only once)
   useEffect(() => {
     const symbol = searchParams.get('symbol');
     const market = searchParams.get('market') || 'A';
+    const name = searchParams.get('name');
+    const force = searchParams.get('force') === '1';
 
     if (symbol && !analysisStarted.current) {
       analysisStarted.current = true;
-      setSelectedStock({ symbol, name: symbol, market });
-      startAnalysis(symbol, market);
+      forceRef.current = force;
+      setSelectedStock({ symbol, name: name || symbol, market });
+      startAnalysis(symbol, market, force);
     }
   }, []);
 
@@ -90,16 +166,18 @@ export default function AnalyzeContent() {
       // Update immediately
       lastUpdateTime.current = now;
       setPartialMarkdown(markdown);
+      updateAnalyzeHeadings(markdown);
     } else if (!updateTimerRef.current) {
       // Schedule update
       const delay = THROTTLE_MS - (now - lastUpdateTime.current);
       updateTimerRef.current = setTimeout(() => {
         lastUpdateTime.current = Date.now();
         setPartialMarkdown(pendingMarkdown.current);
+        updateAnalyzeHeadings(pendingMarkdown.current);
         updateTimerRef.current = null;
       }, delay);
     }
-  }, []);
+  }, [updateAnalyzeHeadings]);
 
   // Cleanup timer on unmount
   useEffect(() => {
@@ -110,13 +188,13 @@ export default function AnalyzeContent() {
     };
   }, []);
 
-  const startAnalysis = useCallback(async (symbol: string, market: string) => {
+  const startAnalysis = useCallback(async (symbol: string, market: string, force: boolean = false) => {
     setStatus('fetching');
-    setProgress(10);
-    setCurrentStep('fetching_data');
+    setProgress(5);
     setError(undefined);
     setResult(null);
     setPartialMarkdown('');
+    setSteps([]);
     lastUpdateTime.current = 0;
     pendingMarkdown.current = '';
 
@@ -124,7 +202,7 @@ export default function AnalyzeContent() {
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ symbol, market })
+        body: JSON.stringify({ symbol, market, force })
       });
 
       if (!response.ok) {
@@ -147,22 +225,42 @@ export default function AnalyzeContent() {
 
         for (const { event, data } of events) {
           switch (event) {
+            case 'cached': {
+              // 命中 7 天报告缓存：直接跳到已有报告页，不再走 DeepSeek
+              const { reportId } = data as { reportId: string; ageDays: number };
+              setStatus('complete');
+              setProgress(100);
+              router.replace(`/reports/${reportId}`);
+              return;
+            }
+            // 新的统一步骤事件：直接 upsert 到时间线
+            case 'step': {
+              const payload = data as StepEventPayload;
+              upsertStep(payload);
+              // 进度条按 key + status 推进
+              if (payload.key === 'fetch' && payload.status === 'running') setProgress(p => Math.max(p, 15));
+              if (payload.key === 'fetch' && payload.status === 'done')    setProgress(p => Math.max(p, 25));
+              if (payload.key === 'analyze' && payload.status === 'running') {
+                setStatus('analyzing');
+                setProgress(p => Math.max(p, 30));
+              }
+              if (payload.key === 'analyze' && payload.status === 'done')  setProgress(p => Math.max(p, 88));
+              if (payload.key === 'parse' && payload.status === 'done')    setProgress(p => Math.max(p, 93));
+              if (payload.key === 'save'  && payload.status === 'done')    setProgress(p => Math.max(p, 97));
+              break;
+            }
+            // 旧事件继续保留：用于流式追加 markdown
             case 'fetching_data':
               setStatus('fetching');
-              setProgress(20);
-              setCurrentStep('fetching_data');
               break;
             case 'data_fetched':
               setStatus('analyzing');
-              setProgress(30);
-              setCurrentStep('data_fetched');
               break;
             case 'analyzing':
               setStatus('analyzing');
-              setCurrentStep('analyzing');
               chunkCount++;
               if (chunkCount % 10 === 0) {
-                setProgress(prev => Math.min(80, prev + 1));
+                setProgress(prev => Math.min(85, prev + 1));
               }
               if ((data as Record<string, unknown>).partial) {
                 throttledSetMarkdown((data as Record<string, string>).partial);
@@ -171,19 +269,10 @@ export default function AnalyzeContent() {
               }
               break;
             case 'analysis_complete':
-              setProgress(85);
-              setCurrentStep('analysis_complete');
               if (pendingMarkdown.current) {
                 setPartialMarkdown(pendingMarkdown.current);
+                updateAnalyzeHeadings(pendingMarkdown.current);
               }
-              break;
-            case 'parsed':
-              setProgress(90);
-              setCurrentStep('parsed');
-              break;
-            case 'saved':
-              setProgress(95);
-              setCurrentStep('saved');
               break;
             case 'complete':
               setStatus('complete');
@@ -199,19 +288,36 @@ export default function AnalyzeContent() {
       }
     } catch (err) {
       setStatus('error');
-      setError((err as Error).message);
+      const raw = (err as Error).message || '未知错误';
+      // 浏览器 fetch 的网络层错误通常是 "Failed to fetch" / "Load failed" / "NetworkError"
+      // 翻译成中文，方便用户判断是 dev server 没跑、端口对不上、还是流被中断
+      const isNetworkError = /failed to fetch|load failed|networkerror|err_/i.test(raw);
+      setError(isNetworkError
+        ? `无法连接到分析服务（${raw}）。请确认开发服务器正在运行、当前浏览器地址端口与服务器一致，然后重试。`
+        : raw);
     }
-  }, [throttledSetMarkdown]);
+  }, [throttledSetMarkdown, updateAnalyzeHeadings, upsertStep, router]);
 
   const handleStockSelect = (stock: Stock) => {
     setSelectedStock(stock);
-    router.push(`/analyze?symbol=${stock.symbol}&market=${stock.market}`);
-    startAnalysis(stock.symbol, stock.market);
+    // 切换到新股票时重置 force：用户主动选股的语义是「分析这只」，应允许缓存命中
+    forceRef.current = false;
+    router.push(`/analyze?symbol=${stock.symbol}&market=${stock.market}&name=${encodeURIComponent(stock.name)}`);
+    startAnalysis(stock.symbol, stock.market, false).catch(err => {
+      console.error('Analysis failed:', err);
+      setStatus('error');
+      setError((err as Error).message);
+    });
   };
 
   const handleRetry = () => {
     if (selectedStock) {
-      startAnalysis(selectedStock.symbol, selectedStock.market);
+      // 沿用本次会话的 force 值（用户从报告页带 force=1 进来时，重试也应继续强制）
+      startAnalysis(selectedStock.symbol, selectedStock.market, forceRef.current).catch(err => {
+        console.error('Analysis failed:', err);
+        setStatus('error');
+        setError((err as Error).message);
+      });
     }
   };
 
@@ -235,12 +341,12 @@ export default function AnalyzeContent() {
         </CardContent>
       </Card>
 
-      {/* Analysis Progress */}
+      {/* Analysis Timeline */}
       {status !== 'idle' && status !== 'complete' && (
-        <AnalysisProgress
+        <AnalysisTimeline
           status={status}
           progress={progress}
-          currentStep={currentStep}
+          steps={steps}
           partialMarkdown={partialMarkdown}
           error={error}
         />
@@ -271,6 +377,24 @@ export default function AnalyzeContent() {
             <DimensionBreakdown dimensions={result.parsed.dimensions} />
             <KeyMetrics metrics={result.parsed.metrics} />
           </div>
+
+          {/* 完成后也保留一份「分析过程」时间线，让用户回看 AI 走过的步骤 */}
+          {steps.length > 0 && (
+            <details className="bg-white rounded-lg border p-4">
+              <summary className="cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900">
+                查看本次分析过程（{steps.length} 步）
+              </summary>
+              <div className="mt-3">
+                <AnalysisTimeline
+                  status="complete"
+                  progress={100}
+                  steps={steps}
+                  partialMarkdown=""
+                  error={undefined}
+                />
+              </div>
+            </details>
+          )}
 
           <Card>
             <CardHeader>
