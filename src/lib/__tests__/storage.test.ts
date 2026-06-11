@@ -17,6 +17,7 @@ const mockFs = {
   writeFile: vi.fn().mockResolvedValue(undefined),
   readdir: vi.fn().mockResolvedValue([]),
   unlink: vi.fn().mockResolvedValue(undefined),
+  rename: vi.fn().mockResolvedValue(undefined),
 };
 
 vi.mock('fs/promises', () => ({
@@ -24,7 +25,7 @@ vi.mock('fs/promises', () => ({
 }));
 
 // 动态导入，让 mock 先生效
-const { saveReport, getReport, listReports, deleteReport } = await import('@/lib/storage');
+const { saveReport, getReport, listReports, deleteReport, findRecentReport } = await import('@/lib/storage');
 
 describe('storage - saveReport（P0：异步 I/O 验证）', () => {
   beforeEach(() => {
@@ -89,9 +90,14 @@ describe('storage - saveReport（P0：异步 I/O 验证）', () => {
 
     await saveReport('600519', 'A', '# 茅台分析', { name: '贵州茅台', score: 85 });
 
-    // 索引应该被更新（写入 3 个文件：JSON + MD + index.json）
+    // 索引应该被更新（写入 3 个文件：JSON + MD + index.tmp，然后 rename）
+    const indexRenameCall = mockFs.rename.mock.calls.find(
+      (c: unknown[]) => String(c[1]).endsWith('index.json')
+    );
+    expect(indexRenameCall).toBeDefined();
+
     const indexWriteCall = mockFs.writeFile.mock.calls.find(
-      (c: unknown[]) => String(c[0]).endsWith('index.json')
+      (c: unknown[]) => String(c[0]).endsWith('.tmp')
     );
     expect(indexWriteCall).toBeDefined();
 
@@ -252,8 +258,13 @@ describe('storage - deleteReport', () => {
 
     await deleteReport('delete-id');
 
+    const indexRenameCall = mockFs.rename.mock.calls.find(
+      (c: unknown[]) => String(c[1]).endsWith('index.json')
+    );
+    expect(indexRenameCall).toBeDefined();
+
     const indexWriteCall = mockFs.writeFile.mock.calls.find(
-      (c: unknown[]) => String(c[0]).endsWith('index.json')
+      (c: unknown[]) => String(c[0]).endsWith('.tmp')
     );
     expect(indexWriteCall).toBeDefined();
 
@@ -275,5 +286,84 @@ describe('storage - deleteReport', () => {
     mockFs.unlink.mockRejectedValue(new Error('EACCES'));
 
     await expect(deleteReport('test-id')).rejects.toThrow('EACCES');
+  });
+});
+
+describe('storage - findRecentReport（7 天报告缓存）', () => {
+  const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1000;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('返回 TTL 内的最新报告（命中缓存）', async () => {
+    const indexData = [
+      { id: 'b', symbol: '600519', name: '贵州茅台', market: 'A', score: 85, conclusion: '推荐', createdAt: '2026-06-10T00:00:00Z' },
+      { id: 'a', symbol: '600519', name: '贵州茅台', market: 'A', score: 80, conclusion: '推荐', createdAt: '2026-06-05T00:00:00Z' },
+    ];
+    mockFs.readFile.mockResolvedValue(JSON.stringify(indexData));
+
+    const now = Date.parse('2026-06-11T00:00:00Z');
+    const result = await findRecentReport('600519', 'A', SEVEN_DAYS, now);
+
+    expect(result?.id).toBe('b'); // 最新一份
+  });
+
+  it('最新匹配也已超期时返回 null', async () => {
+    const indexData = [
+      { id: 'a', symbol: '600519', name: '贵州茅台', market: 'A', score: 85, conclusion: '推荐', createdAt: '2026-05-30T00:00:00Z' },
+    ];
+    mockFs.readFile.mockResolvedValue(JSON.stringify(indexData));
+
+    const now = Date.parse('2026-06-11T00:00:00Z'); // 距离 createdAt 12 天，超期
+    const result = await findRecentReport('600519', 'A', SEVEN_DAYS, now);
+
+    expect(result).toBeNull();
+  });
+
+  it('symbol 或 market 不匹配时返回 null', async () => {
+    const indexData = [
+      { id: 'a', symbol: '000001', name: '平安银行', market: 'A', score: 70, conclusion: '观望', createdAt: '2026-06-10T00:00:00Z' },
+    ];
+    mockFs.readFile.mockResolvedValue(JSON.stringify(indexData));
+
+    const now = Date.parse('2026-06-11T00:00:00Z');
+    expect(await findRecentReport('600519', 'A', SEVEN_DAYS, now)).toBeNull(); // 不同 symbol
+    expect(await findRecentReport('000001', 'HK', SEVEN_DAYS, now)).toBeNull(); // 不同 market
+  });
+
+  it('TTL 边界严格大于：刚好 7 天整应视为过期', async () => {
+    // createdAt 距离 now 正好 7 天
+    const indexData = [
+      { id: 'a', symbol: '600519', name: '贵州茅台', market: 'A', score: 85, conclusion: '推荐', createdAt: '2026-06-04T00:00:00Z' },
+    ];
+    mockFs.readFile.mockResolvedValue(JSON.stringify(indexData));
+
+    const now = Date.parse('2026-06-11T00:00:00Z');
+    expect(await findRecentReport('600519', 'A', SEVEN_DAYS, now)).toBeNull();
+
+    // 早 1 秒（少于 7 天）应命中
+    const justInside = now - 1000;
+    expect((await findRecentReport('600519', 'A', SEVEN_DAYS, justInside))?.id).toBe('a');
+  });
+
+  it('索引为空时返回 null（不报错）', async () => {
+    mockFs.readFile.mockResolvedValue('[]');
+    const result = await findRecentReport('600519', 'A');
+    expect(result).toBeNull();
+  });
+
+  it('跳过最新匹配前的非匹配条目（不会被首条非匹配误终止）', async () => {
+    const indexData = [
+      // 索引按 createdAt DESC：最新的是别的股票，目标股票排第二
+      { id: 'other', symbol: '000001', name: '平安银行', market: 'A', score: 70, conclusion: '观望', createdAt: '2026-06-10T00:00:00Z' },
+      { id: 'target', symbol: '600519', name: '贵州茅台', market: 'A', score: 85, conclusion: '推荐', createdAt: '2026-06-09T00:00:00Z' },
+    ];
+    mockFs.readFile.mockResolvedValue(JSON.stringify(indexData));
+
+    const now = Date.parse('2026-06-11T00:00:00Z');
+    const result = await findRecentReport('600519', 'A', SEVEN_DAYS, now);
+
+    expect(result?.id).toBe('target');
   });
 });
