@@ -39,3 +39,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# stock-value-analyzer skill: 临时取数产物（不属于本仓库）
+/account/_temp_*.json
